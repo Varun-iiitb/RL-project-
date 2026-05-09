@@ -8,6 +8,7 @@ Then open http://localhost:5000 in your browser.
 """
 
 from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
 import pickle
 from collections import defaultdict
 import numpy as np
@@ -23,6 +24,7 @@ from oa_agent import OpponentAwareQLearningAgent
 from q_agent import QLearningAgent
 
 app = Flask(__name__)
+CORS(app)
 
 # ── Global demo session (single-user demo, not thread-safe) ───────────────
 _session: dict = {
@@ -165,7 +167,7 @@ def start_session():
     _session['opponent']      = _make_opponent(opp_type)
     _session['opponent_type'] = opp_type
     _session['agent_type']    = agt_type
-    _session['stats']         = {'hands': 0, 'total_reward': 0.0, 'rewards': []}
+    _session['stats']         = {'hands': 0, 'total_reward': 0.0, 'rewards': [], 'styles': []}
 
     return jsonify({'status': 'ok', 'opponent': opp_type, 'agent': agt_type})
 
@@ -274,6 +276,7 @@ def play_hand():
     s['hands']        += 1
     s['total_reward'] += payoff
     s['rewards'].append(payoff)
+    s['styles'].append(_clf_info(agent)['label'])
 
     return jsonify({
         'steps':  steps,
@@ -283,13 +286,98 @@ def play_hand():
             'avg_reward':   s['total_reward'] / s['hands'],
             'total_reward': s['total_reward'],
             'rewards':      s['rewards'],
+            'styles':       s['styles'],
         },
+    })
+
+
+# ── Interactive Routes (Human vs OA Bot) ──────────────────────────────────
+_interactive_session: dict = {
+    'env': None,
+    'agent': None,
+}
+
+@app.route('/api/interactive/start', methods=['POST'])
+def interactive_start():
+    # The human plays as ID=1, RL Agent as ID=0 (OA usually trains this way)
+    # Actually RL agent is learner_id=0, so the human is ID=1.
+    _interactive_session['env'] = rlcard.make('leduc-holdem')
+    _interactive_session['agent'] = _load_agent('oa')
+    
+    state, player_id = _interactive_session['env'].reset()
+    
+    # If the RL agent gets to act first, let it act before returning state to user
+    agent_action_msg = None
+    if player_id == 0:
+        action = _interactive_session['agent'].act(state)
+        agent_action_msg = ACTION_NAMES.get(action)
+        state, player_id = _interactive_session['env'].step(action)
+        
+    cards = _game_cards(_interactive_session['env'])
+    
+    return jsonify({
+        'status': 'ok',
+        'is_over': _interactive_session['env'].is_over(),
+        'whose_turn': 'human' if player_id == 1 else 'agent',
+        'agent_action': agent_action_msg,
+        'public_card': cards['public'],
+        # IMPORTANT: 'agent' here actually means RL agent's private card, which human shouldn't see!
+        # But wait, we need human's card. In _game_cards, players[0] is RL agent.
+        'human_card': _parse_card(_interactive_session['env'].game.players[1].hand),
+        'pot': 0
+        # 'state': removed because it contains un-serializable np.ndarray which crashes jsonify
+    })
+
+@app.route('/api/interactive/act', methods=['POST'])
+def interactive_act():
+    env = _interactive_session['env']
+    agent = _interactive_session['agent']
+    
+    if env is None or env.is_over():
+        return jsonify({'error': 'Game is over or not started.'}), 400
+        
+    data = request.get_json()
+    human_action_str = data.get('action') # 'CALL', 'RAISE', 'FOLD'
+    
+    # Map string back to integer
+    action_map = {'CALL': CALL, 'RAISE': RAISE, 'FOLD': FOLD, 'CHECK': CALL}
+    # RLCard Leduc doesn't explicitly have CHECK, CALL is mapped to check if no bet
+    human_action = action_map.get(human_action_str, FOLD)
+    
+    try:
+        # 1. Apply human action
+        agent.observe_opponent(human_action) # Update RL agent's opponent classifier!
+        state, player_id = env.step(human_action)
+        
+        agent_action_msg = None
+        
+        # 2. If it's agent's turn after human plays, agent plays
+        while not env.is_over() and player_id == 0:
+            action = agent.act(state)
+            agent_action_msg = ACTION_NAMES.get(action)
+            state, player_id = env.step(action)
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    cards = _game_cards(_interactive_session['env'])
+    payoffs = env.get_payoffs() if env.is_over() else None
+    
+    return jsonify({
+        'is_over': env.is_over(),
+        'whose_turn': 'human' if player_id == 1 else 'agent',
+        'agent_action': agent_action_msg,
+        'public_card': cards['public'],
+        'human_card': _parse_card(env.game.players[1].hand),
+        'agent_card_revealed': cards['agent'] if env.is_over() else None,
+        'pot': 0,
+        'payoff_human': float(payoffs[1]) if payoffs is not None else 0.0,
+        'classifier': _clf_info(agent)
     })
 
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("  Poker RL Demo  ->  http://localhost:5000")
+    print("  Poker RL Demo running with CORS")
     print("=" * 50)
-    # use_reloader=False avoids double-loading the pkl files on startup
-    app.run(debug=False, port=5000, use_reloader=False)
+    app.run(debug=False, port=5001, use_reloader=False)
